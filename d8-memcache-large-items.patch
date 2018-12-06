@@ -1,0 +1,174 @@
+diff --git a/src/MemcacheBackend.php b/src/MemcacheBackend.php
+index d85de8e..3b94f24 100644
+--- a/src/MemcacheBackend.php
++++ b/src/MemcacheBackend.php
+@@ -3,6 +3,7 @@
+ namespace Drupal\memcache;
+
+ use Drupal\Component\Assertion\Inspector;
++use Drupal\Component\Utility\Crypt;
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Cache\CacheTagsChecksumInterface;
+ use Drupal\memcache\Invalidator\TimestampInvalidatorInterface;
+@@ -13,6 +14,14 @@
+ class MemcacheBackend implements CacheBackendInterface {
+
+   /**
++   * The maximum size of an individual cache chunk.
++   *
++   * Equal to 1048576 (bytes in 1mb) - 512 (assumed overhead of cid, timestamp,
++   * and serialization metadata)
++   */
++  const MAX_CHUNK_SIZE = 500000;
++
++  /**
+    * The cache bin to use.
+    *
+    * @var string
+@@ -90,6 +99,19 @@ public function getMultiple(&$cids, $allow_invalid = FALSE) {
+       }
+
+       if ($this->valid($result->cid, $result) || $allow_invalid) {
++
++        // If the item is multipart, rebuild the original cache data by fetching
++        // children and combining them back into a single item.
++        if ($result->data instanceof MultipartItem) {
++          $childCIDs = $result->data->getCids();
++          $dataParts = $this->memcache->getMulti($childCIDs);
++          if (count($dataParts) !== count($childCIDs)) {
++            // We're missing a chunk of the original entry. It is not valid.
++            continue;
++          }
++          $result->data = $this->combineItems($dataParts);
++        }
++
+         // Add it to the fetched items to diff later.
+         $fetched[$result->cid] = $result;
+       }
+@@ -152,9 +174,78 @@ public function set($cid, $data, $expire = CacheBackendInterface::CACHE_PERMANEN
+     $cache->checksum = $this->checksumProvider->getCurrentChecksum($tags);
+
+     // Cache all items permanently. We handle expiration in our own logic.
++    if ($this->memcache->set($cid, $cache)) {
++      return TRUE;
++    }
++
++    // Assume that the item is too large.  We need to split it into multiple
++    // chunks with a parent entry referencing all the chunks.
++    $childKeys = [];
++    foreach ($this->splitItem($cache) as $part) {
++      // If a single chunk fails to be set, stop trying - we can't reconstitute
++      // a value with a missing chunk.
++      if (!$this->memcache->set($part->cid, $part)) {
++        return FALSE;
++      }
++      $childKeys[] = $part->cid;
++    }
++
++    // Create and write the parent entry referencing all chunks.
++    $cache->data = new MultipartItem($childKeys);
+     return $this->memcache->set($cid, $cache);
+   }
+
++ /**
++   * Given a single cache item, split it into multiple child items.
++   *
++   * @param \stdClass $item
++   *   The original cache item, before the split.
++   *
++   * @return \stdClass[]
++   *   An array of child items.
++   */
++  private function splitItem(\stdClass $item) {
++    $data = serialize($item->data);
++    $pieces = str_split($data, static::MAX_CHUNK_SIZE);
++
++    // Add a unique identifier each time this function is invoked.  This
++    // prevents a race condition where two sets on the same multipart item can
++    // clobber each other's children.  With this seed, each time a multipart
++    // entry is created, they get a different CID.  The parent (multipart) entry
++    // does not inherit this unique identifier, so it is still addressable using
++    // the CID it was initially given.
++    $seed = Crypt::randomBytesBase64();
++
++    $children = [];
++
++    foreach ($pieces as $i => $chunk) {
++      // Child items do not need tags or expire, since that data is carried by
++      // the parent.
++      $chunkItem = new \stdClass();
++      $chunkItem->cid = sprintf('%s.%s.%d', $item->cid, $seed, $i);
++      $chunkItem->data = $chunk;
++      $chunkItem->created = $item->created;
++      $children[] = $chunkItem;
++    }
++    return $children;
++  }
++
++  /**
++   * Given an array of child cache items, recombine into a single value.
++   *
++   * @param \stdClass[] $items
++   *   An array of child cache items.
++   *
++   * @return mixed
++   *   The combined an unserialized value that was originally stored.
++   */
++  private function combineItems(array $items) {
++    $data = array_reduce($items, function($collected, $item) {
++      return $collected . $item->data;
++    }, '');
++    return unserialize($data);
++  }
++
+   /**
+    * {@inheritdoc}
+    */
+diff --git a/src/MultipartItem.php b/src/MultipartItem.php
+new file mode 100644
+index 0000000..63af183
+--- /dev/null
++++ b/src/MultipartItem.php
+@@ -0,0 +1,42 @@
++<?php
++
++namespace Drupal\memcache;
++
++/**
++ * Wrapper for a split cache item.
++ *
++ * When a cache item is larger than Memcache can handle as a single item, it
++ * gets split into smaller chunks and stored as multiple items.  An object of
++ * this class gets stored with the original CID - it does not contain data
++ * itself, but tracks the CIDs of the children that contain the data.
++ */
++class MultipartItem {
++
++  /**
++   * The CIDs that contain the item's data.
++   *
++   * @var array
++   */
++  private $cids;
++
++  /**
++   * Constructor.
++   *
++   * @param string[] $cids
++   *   The CIDs that contain the item's data.
++   */
++  public function __construct(array $cids) {
++    $this->cids = $cids;
++  }
++
++  /**
++   * Get the CIDs of this item's children.
++   *
++   * @return string[]
++   *   The CIDs that contain the item's data.
++   */
++  public function getCids() {
++    return $this->cids;
++  }
++
++}

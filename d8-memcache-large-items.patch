@@ -1,33 +1,67 @@
+diff --git a/src/Driver/MemcachedDriver.php b/src/Driver/MemcachedDriver.php
+index 0e8e67d..7f33cd2 100755
+--- a/src/Driver/MemcachedDriver.php
++++ b/src/Driver/MemcachedDriver.php
+@@ -16,6 +16,16 @@ class MemcachedDriver extends DriverBase {
+     $full_key = $this->key($key);
+     $result = $this->memcache->set($full_key, $value, $exp);
+ 
++    // DEBUG: Comment these out if you want more debugging.
++    #if (!$result) {
++    #  // Something bad happened. Let's log the problem.
++    #  $result_code = $this->memcache->getResultCode();
++    #  $result_message = $this->memcache->getResultMessage();
++    #  \Drupal::logger('memcache')->error(
++    #    "MemcachedDriver::set() error key=@key error=[@error_code]@error_msg",
++    #    ['@key' => $full_key, '@error_code' => $result_code, '@error_msg' => $result_message]
++    #  );
++    #}
+     if ($collect_stats) {
+       $this->statsWrite('set', 'cache', [$full_key => (int) $result]);
+     }
 diff --git a/src/MemcacheBackend.php b/src/MemcacheBackend.php
-index d85de8e..3b94f24 100644
+index d85de8e..1b30007 100644
 --- a/src/MemcacheBackend.php
 +++ b/src/MemcacheBackend.php
 @@ -3,6 +3,7 @@
  namespace Drupal\memcache;
-
+ 
  use Drupal\Component\Assertion\Inspector;
 +use Drupal\Component\Utility\Crypt;
  use Drupal\Core\Cache\CacheBackendInterface;
  use Drupal\Core\Cache\CacheTagsChecksumInterface;
  use Drupal\memcache\Invalidator\TimestampInvalidatorInterface;
-@@ -13,6 +14,14 @@
+@@ -13,6 +14,27 @@ use Drupal\memcache\Invalidator\TimestampInvalidatorInterface;
  class MemcacheBackend implements CacheBackendInterface {
-
+ 
    /**
 +   * The maximum size of an individual cache chunk.
 +   *
-+   * Equal to 1048576 (bytes in 1mb) - 512 (assumed overhead of cid, timestamp,
-+   * and serialization metadata)
-+   */
-+  const MAX_CHUNK_SIZE = 500000;
++   * Memcached is about balance. With this area of functionality, we need to
++   * minimize the number of split items while also considering wasted memory.
++   * In Memcached, all slab "pages" contain 1MB of data, by default.  Therefore,
++   * when we split items, we want to do to in a manner that comes close to
++   * filling a slab page with as little remaining memory as possible, while
++   * taking item overhead into consideration.
++   *
++   * Our tests concluded that Memached slab 39 is a perfect slab to target.
++   * Slab 39 contains items roughly between 385-512KB in size.  We are targeting
++   * a chunk size of 493568 bytes (482kb) - which will give us enough storage
++   * for two split items, leaving as little overhead as possible.
++   *
++   * Note that the overhead not only includes metadata about each item, but
++   * also allows compression "backfiring" (under some circumstances, compression
++   * actually enlarges some data objects instead of shrinking them).   */
++
++  const MAX_CHUNK_SIZE = 470000;
 +
 +  /**
     * The cache bin to use.
     *
     * @var string
-@@ -90,6 +99,19 @@ public function getMultiple(&$cids, $allow_invalid = FALSE) {
+@@ -90,6 +112,19 @@ class MemcacheBackend implements CacheBackendInterface {
        }
-
+ 
        if ($this->valid($result->cid, $result) || $allow_invalid) {
 +
 +        // If the item is multipart, rebuild the original cache data by fetching
@@ -45,9 +79,9 @@ index d85de8e..3b94f24 100644
          // Add it to the fetched items to diff later.
          $fetched[$result->cid] = $result;
        }
-@@ -152,9 +174,78 @@ public function set($cid, $data, $expire = CacheBackendInterface::CACHE_PERMANEN
+@@ -152,9 +187,84 @@ class MemcacheBackend implements CacheBackendInterface {
      $cache->checksum = $this->checksumProvider->getCurrentChecksum($tags);
-
+ 
      // Cache all items permanently. We handle expiration in our own logic.
 +    if ($this->memcache->set($cid, $cache)) {
 +      return TRUE;
@@ -69,7 +103,7 @@ index d85de8e..3b94f24 100644
 +    $cache->data = new MultipartItem($childKeys);
      return $this->memcache->set($cid, $cache);
    }
-
+ 
 + /**
 +   * Given a single cache item, split it into multiple child items.
 +   *
@@ -97,11 +131,17 @@ index d85de8e..3b94f24 100644
 +      // Child items do not need tags or expire, since that data is carried by
 +      // the parent.
 +      $chunkItem = new \stdClass();
-+      $chunkItem->cid = sprintf('%s.%s.%d', $item->cid, $seed, $i);
++      // @TODO: mention why we added split and picked this order...
++      $chunkItem->cid = sprintf('split.%d.%s.%s', $i, $item->cid, $seed);
 +      $chunkItem->data = $chunk;
 +      $chunkItem->created = $item->created;
 +      $children[] = $chunkItem;
 +    }
++    // DEBUG: Comment these out if you want more debugging.
++    #\Drupal::logger('memcache')->debug(
++    #  "Split item @cid into @num pieces",
++    #  ['@cid' => $item->cid, '@num' => ($i+1)]
++    #);
 +    return $children;
 +  }
 +
@@ -124,9 +164,57 @@ index d85de8e..3b94f24 100644
    /**
     * {@inheritdoc}
     */
+@@ -189,6 +299,11 @@ class MemcacheBackend implements CacheBackendInterface {
+    * {@inheritdoc}
+    */
+   public function deleteAll() {
++    // DEBUG: Comment these out if you want more debugging.
++    #\Drupal::logger('memcache')->debug(
++    #  "Called deleteAll() on bin @bin",
++    #  ['@bin' => $this->bin]
++    #);
+     $this->lastBinDeletionTime = $this->timestampInvalidator->invalidateTimestamp($this->bin);
+   }
+ 
+@@ -226,6 +341,11 @@ class MemcacheBackend implements CacheBackendInterface {
+    * {@inheritdoc}
+    */
+   public function invalidateAll() {
++    // DEBUG: Comment these out if you want more debugging.
++    #\Drupal::logger('memcache')->debug(
++    #  "Called invalidateAll() on bin @bin",
++    #  ['@bin' => $this->bin]
++    #);
+     $this->invalidateTags(["memcache:$this->bin"]);
+   }
+ 
+@@ -233,6 +353,11 @@ class MemcacheBackend implements CacheBackendInterface {
+    * {@inheritdoc}
+    */
+   public function invalidateTags(array $tags) {
++    // DEBUG: Comment these out if you want more debugging.
++    #\Drupal::logger('memcache')->debug(
++    #  "Called invalidateTags() on tags @tags",
++    #  ['@tags' => implode(',', $tags)]
++    #);
+     $this->checksumProvider->invalidateTags($tags);
+   }
+ 
+@@ -240,6 +365,11 @@ class MemcacheBackend implements CacheBackendInterface {
+    * {@inheritdoc}
+    */
+   public function removeBin() {
++    // DEBUG: Comment these out if you want more debugging.
++    #\Drupal::logger('memcache')->debug(
++    #  "Called removeBin() on bin @bin",
++    #  ['@bin' => $this->bin]
++    #);
+     $this->lastBinDeletionTime = $this->timestampInvalidator->invalidateTimestamp($this->bin);
+   }
+ 
 diff --git a/src/MultipartItem.php b/src/MultipartItem.php
 new file mode 100644
-index 0000000..63af183
+index 0000000..42673ff
 --- /dev/null
 +++ b/src/MultipartItem.php
 @@ -0,0 +1,42 @@
